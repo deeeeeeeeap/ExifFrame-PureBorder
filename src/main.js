@@ -8,7 +8,6 @@ const path = require('node:path');
 const fs = require('node:fs');
 const sharp = require('sharp');
 const exifr = require('exifr');
-const { Worker } = require('worker_threads');
 
 // 配置 Sharp 使用多线程（利用多核 CPU）
 sharp.concurrency(4);
@@ -63,6 +62,44 @@ function escapeXml(str) {
   return String(str).replace(/[<>&'"]/g, c => ({
     '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;'
   }[c]));
+}
+
+async function getRotatedImageBuffer(filePath) {
+  const { data, info } = await sharp(filePath, { sequentialRead: true })
+    .rotate()
+    .toBuffer({ resolveWithObject: true });
+
+  return {
+    buffer: data,
+    width: info.width,
+    height: info.height
+  };
+}
+
+async function resizeImageBuffer(buffer, width, height, maxSize) {
+  const originalMax = Math.max(width, height);
+  if (originalMax <= maxSize) {
+    return { buffer, width, height };
+  }
+
+  const scale = maxSize / originalMax;
+  const { data, info } = await sharp(buffer, { sequentialRead: true })
+    .resize(Math.round(width * scale), Math.round(height * scale))
+    .toBuffer({ resolveWithObject: true });
+
+  return {
+    buffer: data,
+    width: info.width,
+    height: info.height
+  };
+}
+
+function encodePoster(pipeline, format = 'png') {
+  if (format === 'jpg' || format === 'jpeg') {
+    return pipeline.jpeg({ quality: 95 }).toBuffer();
+  }
+
+  return pipeline.png().toBuffer();
 }
 
 // ========================================
@@ -141,10 +178,17 @@ ipcMain.handle('read-exif', async (event, filePath) => {
 // ========================================
 ipcMain.handle('load-image', async (event, filePath) => {
   try {
-    const image = sharp(filePath);
-    const metadata = await image.metadata();
-    const buffer = await image.rotate().resize(800, 800, { fit: 'inside', withoutEnlargement: true }).jpeg({ quality: 85 }).toBuffer();
-    return { width: metadata.width, height: metadata.height, base64: `data:image/jpeg;base64,${buffer.toString('base64')}` };
+    const rotatedImage = await getRotatedImageBuffer(filePath);
+    const previewBuffer = await sharp(rotatedImage.buffer, { sequentialRead: true })
+      .resize(800, 800, { fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: 85 })
+      .toBuffer();
+
+    return {
+      width: rotatedImage.width,
+      height: rotatedImage.height,
+      base64: `data:image/jpeg;base64,${previewBuffer.toString('base64')}`
+    };
   } catch (e) {
     throw e;
   }
@@ -153,22 +197,15 @@ ipcMain.handle('load-image', async (event, filePath) => {
 /**
  * 生成经典白底海报（专业留白比例）
  */
-ipcMain.handle('generate-classic-poster', async (event, filePath, exifInfo, isPreview = false) => {
+ipcMain.handle('generate-classic-poster', async (event, filePath, exifInfo, isPreview = false, outputFormat = 'png') => {
   try {
-    const rotatedBuffer = await sharp(filePath).rotate().toBuffer();
-    let metadata = await sharp(rotatedBuffer).metadata();
-
-    let workBuffer = rotatedBuffer;
-    if (isPreview && Math.max(metadata.width, metadata.height) > 1200) {
-      const scale = 1200 / Math.max(metadata.width, metadata.height);
-      workBuffer = await sharp(rotatedBuffer)
-        .resize(Math.round(metadata.width * scale), Math.round(metadata.height * scale))
-        .toBuffer();
-      metadata = await sharp(workBuffer).metadata();
+    let workImage = await getRotatedImageBuffer(filePath);
+    if (isPreview) {
+      workImage = await resizeImageBuffer(workImage.buffer, workImage.width, workImage.height, 1200);
     }
 
-    const imgWidth = metadata.width;
-    const imgHeight = metadata.height;
+    const imgWidth = workImage.width;
+    const imgHeight = workImage.height;
 
     // 专业留白比例
     const padding = Math.round(Math.min(imgWidth, imgHeight) * 0.08);
@@ -204,18 +241,19 @@ ipcMain.handle('generate-classic-poster', async (event, filePath, exifInfo, isPr
       </svg>
     `;
 
-    const poster = await sharp({
-      create: { width: posterWidth, height: posterHeight, channels: 3, background: { r: 255, g: 255, b: 255 } }
-    })
-      .composite([
-        { input: workBuffer, top: padding, left: padding },
-        { input: Buffer.from(infoSvg), top: padding + imgHeight + padding, left: 0 }
-      ])
-      .png()
-      .toBuffer();
+    const poster = await encodePoster(
+      sharp({
+        create: { width: posterWidth, height: posterHeight, channels: 3, background: { r: 255, g: 255, b: 255 } }
+      })
+        .composite([
+          { input: workImage.buffer, top: padding, left: padding },
+          { input: Buffer.from(infoSvg), top: padding + imgHeight + padding, left: 0 }
+        ]),
+      outputFormat
+    );
 
     // 显式释放 Buffer，帮助 GC 回收内存
-    workBuffer = null;
+    workImage.buffer = null;
 
     return poster;
   } catch (e) {
@@ -260,6 +298,10 @@ const DEFAULT_LOGO_MAP = {
   'hasselblad': 'Hasselblad_Logo.svg.png',
   'pentax': 'Pentax_Logo.svg.png'
 };
+
+let cachedLogoConfigPath = null;
+let cachedLogoMap = null;
+const cachedLogoFiles = new Map();
 
 /**
  * 获取 Logo 映射表（优先读取用户配置文件）
@@ -309,6 +351,63 @@ function getLogoPath(cameraMake) {
   return null;
 }
 
+function getLogoMap() {
+  const logoDir = getLogoDir();
+  const configPath = path.join(logoDir, 'logo_config.json');
+
+  if (cachedLogoMap && cachedLogoConfigPath === configPath) {
+    return cachedLogoMap;
+  }
+
+  try {
+    if (fs.existsSync(configPath)) {
+      const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      if (config.mappings) {
+        const userMappings = {};
+        for (const [key, value] of Object.entries(config.mappings)) {
+          if (!key.startsWith('_')) {
+            userMappings[key] = value;
+          }
+        }
+
+        cachedLogoConfigPath = configPath;
+        cachedLogoMap = { ...DEFAULT_LOGO_MAP, ...userMappings };
+        return cachedLogoMap;
+      }
+    }
+  } catch (e) {
+    console.warn('璇诲彇 Logo 閰嶇疆鏂囦欢澶辫触:', e.message);
+  }
+
+  cachedLogoConfigPath = configPath;
+  cachedLogoMap = DEFAULT_LOGO_MAP;
+  return cachedLogoMap;
+}
+
+function getLogoPath(cameraMake) {
+  if (!cameraMake) return null;
+  const make = cameraMake.toLowerCase();
+  const logoDir = getLogoDir();
+  const logoMap = getLogoMap();
+
+  for (const [keyword, filename] of Object.entries(logoMap)) {
+    if (make.includes(keyword)) {
+      const logoPath = path.join(logoDir, filename);
+      if (cachedLogoFiles.has(logoPath)) {
+        return cachedLogoFiles.get(logoPath) ? logoPath : null;
+      }
+
+      const exists = fs.existsSync(logoPath);
+      cachedLogoFiles.set(logoPath, exists);
+      if (exists) {
+        return logoPath;
+      }
+    }
+  }
+
+  return null;
+}
+
 /**
  * 生成噪点纹理层（模拟胶片颗粒）
  * @param {number} width - 画布宽度
@@ -352,30 +451,20 @@ function generateAtmosphereGradient(width, height) {
   `;
 }
 
-ipcMain.handle('generate-blur-poster', async (event, filePath, exifInfo, isPreview = false, exportQuality = 'high', logoScale = 1.0, logoPosition = 0.5) => {
+ipcMain.handle('generate-blur-poster', async (event, filePath, exifInfo, isPreview = false, exportQuality = 'high', logoScale = 1.0, logoPosition = 0.5, outputFormat = 'png') => {
   try {
     // exportQuality: 'high' = 原画质, 'fast' = 快速导出（限制最大 3000px）
     const MAX_SIZE_HIGH = 8000;   // 原画质最大 8000px（防止内存溢出）
     const MAX_SIZE_FAST = 3000;   // 快速导出最大 3000px
     const maxSize = isPreview ? 1200 : (exportQuality === 'fast' ? MAX_SIZE_FAST : MAX_SIZE_HIGH);
 
-    const rotatedBuffer = await sharp(filePath).rotate().toBuffer();
-    let metadata = await sharp(rotatedBuffer).metadata();
-
-    let workBuffer = rotatedBuffer;
-    const originalMax = Math.max(metadata.width, metadata.height);
+    let workImage = await getRotatedImageBuffer(filePath);
 
     // 根据质量设置限制分辨率
-    if (originalMax > maxSize) {
-      const scale = maxSize / originalMax;
-      workBuffer = await sharp(rotatedBuffer)
-        .resize(Math.round(metadata.width * scale), Math.round(metadata.height * scale))
-        .toBuffer();
-      metadata = await sharp(workBuffer).metadata();
-    }
+    workImage = await resizeImageBuffer(workImage.buffer, workImage.width, workImage.height, maxSize);
 
-    const imgWidth = metadata.width;
-    const imgHeight = metadata.height;
+    const imgWidth = workImage.width;
+    const imgHeight = workImage.height;
 
     // ========================================
     // 简洁相框风格 - 照片为主，底部信息条
@@ -424,7 +513,7 @@ ipcMain.handle('generate-blur-poster', async (event, filePath, exifInfo, isPrevi
     const bgScale = isPreview ? 0.15 : 0.25;  // 更小的中间尺寸以加速
 
     // 合并背景生成：缩小 → 调色 → 模糊 → 放大（一条链）
-    const bgPromise = sharp(workBuffer)
+    const bgPromise = sharp(workImage.buffer)
       .resize(Math.round(posterWidth * bgScale), Math.round(posterHeight * bgScale), { fit: 'cover' })
       .modulate({ brightness: 0.5, saturation: 1.3 })
       .blur(blurRadius)
@@ -464,7 +553,7 @@ ipcMain.handle('generate-blur-poster', async (event, filePath, exifInfo, isPrevi
       <rect width="${mainW}" height="${mainH}" rx="${cornerRadius}" fill="white"/>
     </svg>`;
 
-    const photoPromise = sharp(workBuffer)
+    const photoPromise = sharp(workImage.buffer)
       .resize(mainW, mainH, { fit: 'fill' })
       .composite([{ input: Buffer.from(roundedMaskSvg), blend: 'dest-in' }])
       .png({ compressionLevel: 6 })
@@ -476,17 +565,20 @@ ipcMain.handle('generate-blur-poster', async (event, filePath, exifInfo, isPrevi
     ]);
 
     // 叠加大气渐变和噪点（合并到最终合成）
-    const atmosphereSvg = generateAtmosphereGradient(posterWidth, posterHeight);
-    let blurredBg = await sharp(bgBuffer)
-      .composite([{ input: Buffer.from(atmosphereSvg), blend: 'over' }])
-      .toBuffer();
+    const backgroundLayers = [
+      { input: Buffer.from(generateAtmosphereGradient(posterWidth, posterHeight)), blend: 'over' }
+    ];
 
     if (!isPreview) {
-      const noiseSvg = generateNoiseSvg(posterWidth, posterHeight, 0.02);
-      blurredBg = await sharp(blurredBg)
-        .composite([{ input: Buffer.from(noiseSvg), blend: 'over' }])
-        .toBuffer();
+      backgroundLayers.push({
+        input: Buffer.from(generateNoiseSvg(posterWidth, posterHeight, 0.02)),
+        blend: 'over'
+      });
     }
+
+    let blurredBg = await sharp(bgBuffer)
+      .composite(backgroundLayers)
+      .toBuffer();
 
     // ========================================
     // 步骤 8: 加载品牌 Logo（16% 画布宽度，中心 y = H * 0.09）
@@ -618,13 +710,14 @@ ipcMain.handle('generate-blur-poster', async (event, filePath, exifInfo, isPrevi
       composites.push({ input: logoBuffer, top: logoY, left: logoX });
     }
 
-    const poster = await sharp(blurredBg)
-      .composite(composites)
-      .png()
-      .toBuffer();
+    const poster = await encodePoster(
+      sharp(blurredBg).composite(composites),
+      outputFormat
+    );
 
     // 释放内存
-    workBuffer = null;
+    workImage.buffer = null;
+    blurredBg = null;
 
     return poster;
   } catch (e) {
@@ -635,10 +728,27 @@ ipcMain.handle('generate-blur-poster', async (event, filePath, exifInfo, isPrevi
 
 ipcMain.handle('save-poster', async (event, buffer, filePath, format) => {
   try {
-    let outputBuffer = Buffer.from(buffer);
-    if (format === 'jpg' || format === 'jpeg') {
-      outputBuffer = await sharp(outputBuffer).jpeg({ quality: 95 }).toBuffer();
+    const outputBuffer = Buffer.from(buffer);
+    const isJpegBuffer = outputBuffer.length > 3 &&
+      outputBuffer[0] === 0xff &&
+      outputBuffer[1] === 0xd8 &&
+      outputBuffer[2] === 0xff;
+    const isPngBuffer = outputBuffer.length > 8 &&
+      outputBuffer[0] === 0x89 &&
+      outputBuffer[1] === 0x50 &&
+      outputBuffer[2] === 0x4e &&
+      outputBuffer[3] === 0x47;
+
+    if ((format === 'jpg' || format === 'jpeg') && !isJpegBuffer) {
+      fs.writeFileSync(filePath, await sharp(outputBuffer).jpeg({ quality: 95 }).toBuffer());
+      return true;
     }
+
+    if (format === 'png' && !isPngBuffer) {
+      fs.writeFileSync(filePath, await sharp(outputBuffer).png().toBuffer());
+      return true;
+    }
+
     fs.writeFileSync(filePath, outputBuffer);
     return true;
   } catch (e) {

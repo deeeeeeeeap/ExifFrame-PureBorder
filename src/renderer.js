@@ -257,9 +257,9 @@ async function updatePreview() {
     const logoScale = (document.getElementById('logoSize')?.value || 100) / 100;
     const logoPosition = (document.getElementById('logoPosition')?.value || 50) / 100;
     if (template === 'blur') {
-      posterBuffer = await window.lensframe.generateBlurPoster(file.path, file.exif, true, 'high', logoScale, logoPosition);
+      posterBuffer = await window.lensframe.generateBlurPoster(file.path, file.exif, true, 'high', logoScale, logoPosition, 'png');
     } else {
-      posterBuffer = await window.lensframe.generateClassicPoster(file.path, file.exif, true);
+      posterBuffer = await window.lensframe.generateClassicPoster(file.path, file.exif, true, 'png');
     }
 
     state.currentPoster = posterBuffer;
@@ -321,9 +321,9 @@ async function handleGenerate() {
       const logoScale = (document.getElementById('logoSize')?.value || 100) / 100;
       const logoPosition = (document.getElementById('logoPosition')?.value || 50) / 100;
       if (template === 'blur') {
-        posterBuffer = await window.lensframe.generateBlurPoster(file.path, file.exif, false, quality, logoScale, logoPosition);
+        posterBuffer = await window.lensframe.generateBlurPoster(file.path, file.exif, false, quality, logoScale, logoPosition, format);
       } else {
-        posterBuffer = await window.lensframe.generateClassicPoster(file.path, file.exif, false);
+        posterBuffer = await window.lensframe.generateClassicPoster(file.path, file.exif, false, format);
       }
 
       updateProgress(80, '正在保存文件...');
@@ -367,9 +367,9 @@ async function handleBatchExport() {
       const logoScale = (document.getElementById('logoSize')?.value || 100) / 100;
       const logoPosition = (document.getElementById('logoPosition')?.value || 50) / 100;
       if (template === 'blur') {
-        posterBuffer = await window.lensframe.generateBlurPoster(file.path, file.exif, false, quality, logoScale, logoPosition);
+        posterBuffer = await window.lensframe.generateBlurPoster(file.path, file.exif, false, quality, logoScale, logoPosition, format);
       } else {
-        posterBuffer = await window.lensframe.generateClassicPoster(file.path, file.exif, false);
+        posterBuffer = await window.lensframe.generateClassicPoster(file.path, file.exif, false, format);
       }
 
       // 使用 / 作为路径分隔符，Windows 和 macOS/Linux 均兼容
